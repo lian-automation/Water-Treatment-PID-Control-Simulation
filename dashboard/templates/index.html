@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>水处理加药/曝气回路 PID 控制仿真看板</title>
+<!-- ECharts 经 CDN 引入（浏览器需联网加载一次） -->
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+         background: #f0f2f5; color: #26313f; }
+  header { background: #17334f; color: #fff; padding: 12px 24px;
+           display: flex; justify-content: space-between; align-items: center; }
+  header h1 { font-size: 18px; font-weight: 600; }
+  header .meta { font-size: 12px; opacity: .85; text-align: right; line-height: 1.6; }
+  .wrap { padding: 16px 24px; max-width: 1280px; margin: 0 auto; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: #fff; border-radius: 8px; padding: 14px 16px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .card h2 { font-size: 15px; margin-bottom: 10px; display: flex;
+             justify-content: space-between; align-items: center; }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 10px;
+           background: #e8f7ee; color: #1a7f4b; }
+  .badge.alarm { background: #fdecec; color: #c0392b; }
+  .vals { display: flex; gap: 18px; margin-bottom: 10px; flex-wrap: wrap; }
+  .val b { font-size: 22px; font-family: Consolas, monospace; }
+  .val span { font-size: 12px; color: #7a8699; display: block; }
+  .chart { width: 100%; height: 300px; }
+  .ops { display: grid; grid-template-columns: repeat(4, auto); gap: 8px;
+         align-items: end; margin-top: 10px; font-size: 12px; }
+  .ops label { display: block; color: #7a8699; margin-bottom: 3px; }
+  .ops input { width: 84px; padding: 4px 6px; border: 1px solid #ccd3dd;
+               border-radius: 4px; font-size: 12px; }
+  button { padding: 5px 12px; border: none; border-radius: 4px; cursor: pointer;
+           font-size: 12px; background: #2d6cdf; color: #fff; }
+  button.gray { background: #8492a6; }
+  button:disabled { background: #cfd6df; cursor: not-allowed; }
+  button.mode-on { background: #1a7f4b; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { border-bottom: 1px solid #edf0f4; padding: 6px 8px; text-align: left; }
+  th { color: #7a8699; font-weight: normal; }
+  tr.st-active td { color: #c0392b; }
+  #banner { display: none; background: #fdecec; color: #c0392b;
+            padding: 8px 16px; font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>水处理加药 / 曝气回路 PID 控制仿真看板 <small style="font-size:12px;font-weight:normal">(所有数据为仿真验证值)</small></h1>
+  <div class="meta">
+    <div>仿真时间：<span id="sim-clock">--</span>s｜墙钟：<span id="wall-clock">--</span></div>
+    <div id="backend-mode">后端：--</div>
+  </div>
+</header>
+<div id="banner">通信异常：看板与后端失去联系，正在重试……</div>
+
+<div class="wrap">
+  <!-- 双回路卡片：趋势图 + 当前值 + 操作面板 -->
+  <div class="grid" id="loop-cards"></div>
+
+  <!-- 报警列表 -->
+  <div class="card" style="margin-top:16px">
+    <h2>报警列表（高限 / 低限 / 偏差，连续 5 个周期越限确认）</h2>
+    <table>
+      <thead><tr><th style="width:110px">时间</th><th style="width:180px">回路</th>
+        <th>报警类型</th><th style="width:90px">状态</th></tr></thead>
+      <tbody id="alarm-tbody"><tr><td colspan="4" style="color:#98a2b3">暂无报警记录</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+/* ===================== 基础工具 ===================== */
+const $ = (sel) => document.querySelector(sel);
+const LOOPS = ["dosing", "aeration"];
+const LOOP_TITLES = { dosing: "① 加药回路（变频加药泵开度 → 出水余氯）",
+                      aeration: "② 曝气回路（鼓风机频率 → 溶解氧）" };
+const charts = {};          // echarts 实例缓存
+let lastMode = {};
+
+function fmt(v, digits = 2) {
+  return (v === undefined || v === null) ? "--" : Number(v).toFixed(digits);
+}
+
+/* ===================== 回路卡片 DOM ===================== */
+function buildCards() {
+  const container = $("#loop-cards");
+  for (const key of LOOPS) {
+    const div = document.createElement("div");
+    div.className = "card";
+    div.innerHTML = `
+      <h2>${LOOP_TITLES[key]} <span class="badge" id="${key}-alarm">运行正常</span></h2>
+      <div class="vals">
+        <div class="val"><span>设定值 SP</span><b id="${key}-sp">--</b><span style="display:inline">mg/L</span></div>
+        <div class="val"><span>测量值 PV</span><b id="${key}-pv">--</b><span style="display:inline">mg/L</span></div>
+        <div class="val"><span>输出 OP</span><b id="${key}-op">--</b><span style="display:inline" id="${key}-opunit"></span></div>
+        <div class="val"><span>进水负荷</span><b id="${key}-load">--</b><span style="display:inline">%</span></div>
+      </div>
+      <div class="chart" id="${key}-chart"></div>
+      <div class="ops">
+        <div><label>SP 设定 (mg/L)</label>
+          <input type="number" step="0.05" min="0" max="20" id="${key}-sp-in">
+          <button onclick="sendSp('${key}')">SP下发</button></div>
+        <div><label>手/自动切换</label>
+          <button id="${key}-btn-auto" onclick="sendMode('${key}', true)">自动</button>
+          <button id="${key}-btn-manu" class="gray" onclick="askManual('${key}')">手动</button></div>
+        <div><label>软手操 OP</label>
+          <input type="number" step="1" id="${key}-man-in" disabled>
+          <button id="${key}-man-btn" disabled onclick="sendManual('${key}')">手操下发</button></div>
+        <div><label>PID 在线整定 (Kp / Ti(s) / Td(s))</label>
+          <input type="number" step="0.5" id="${key}-kp" style="width:56px">
+          <input type="number" step="1" id="${key}-ti" style="width:52px">
+          <input type="number" step="0.5" id="${key}-td" style="width:52px">
+          <button class="gray" onclick="sendTuning('${key}')">应用参数</button></div>
+      </div>`;
+    container.appendChild(div);
+    charts[key] = echarts.init(div.querySelector(".chart"));
+  }
+}
+buildCards();
+window.addEventListener("resize", () => Object.values(charts).forEach(c => c.resize()));
+
+/* ===================== 图表配置 ===================== */
+function chartOption(data, opUnit) {
+  return {
+    animation: false,
+    tooltip: { trigger: "axis" },
+    legend: { top: 0, textStyle: { fontSize: 11 } },
+    grid: { left: 46, right: 46, top: 28, bottom: 40 },
+    xAxis: { type: "category", boundaryGap: false,
+             axisLabel: { fontSize: 10 }, data: data.t },
+    yAxis: [
+      { type: "value", name: "mg/L", scale: true, axisLabel: { fontSize: 10 } },
+      { type: "value", name: opUnit, scale: true, axisLabel: { fontSize: 10 },
+        splitLine: { show: false } }
+    ],
+    dataZoom: [                       // 最近 500 点内自由回看
+      { type: "inside" }, { type: "slider", height: 16, bottom: 4 }
+    ],
+    series: [
+      { name: "SP", type: "line", data: data.sp, showSymbol: false,
+        lineStyle: { type: "dashed", width: 1.5 }, color: "#8492a6" },
+      { name: "PV(测量)", type: "line", data: data.pv, showSymbol: false,
+        lineWidth: 1.6, color: "#2d6cdf" },
+      { name: "OP(输出)", type: "line", yAxisIndex: 1, data: data.op,
+        showSymbol: false, lineWidth: 1.2, color: "#e67e22" }
+    ]
+  };
+}
+
+/* ===================== 与后端交互 ===================== */
+async function sendSp(key) {
+  const v = parseFloat($("#" + key + "-sp-in").value);
+  if (isNaN(v)) return alert("请输入有效的 SP 数值");
+  await post("/api/sp", { loop: key, value: v });
+}
+
+async function sendMode(key, auto) {
+  if (!auto) {
+    // 切手动前询问初始手操值，默认取当前输出，保证无扰
+    const cur = document.getElementById(key + "-op").textContent;
+    const inp = prompt(`切入手动模式。请给定初始手操 OP（当前 ${cur}）：`, cur);
+    if (inp === null) return;
+    const v = parseFloat(inp);
+    if (isNaN(v)) return alert("手操值无效");
+    await post("/api/mode", { loop: key, auto: false, manual_op: v });
+  } else {
+    await post("/api/mode", { loop: key, auto: true });
+  }
+}
+
+function askManual(key) { /* 由 sendMode(false) 处理 */ }
+
+async function sendManual(key) {
+  const v = parseFloat($("#" + key + "-man-in").value);
+  if (isNaN(v)) return alert("请输入有效的手操 OP");
+  await post("/api/manual", { loop: key, value: v });
+}
+
+async function sendTuning(key) {
+  const kp = parseFloat($("#" + key + "-kp").value);
+  const ti = parseFloat($("#" + key + "-ti").value);
+  const td = parseFloat($("#" + key + "-td").value);
+  if ([kp, ti, td].some(isNaN)) return alert("P/I/D 参数不完整");
+  await post("/api/tuning", { loop: key, kp, ti, td });
+}
+
+async function post(url, body) {
+  try {
+    const resp = await fetch(url, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    const j = await resp.json();
+    if (!j.ok) alert("操作失败：" + (j.message || resp.status));
+  } catch (err) {
+    alert("请求异常：" + err);
+  }
+}
+
+/* ===================== 轮询刷新 ===================== */
+function updateLoopCard(key, d) {
+  $("#" + key + "-sp").textContent = fmt(d.sp);
+  $("#" + key + "-pv").textContent = fmt(d.pv);
+  $("#" + key + "-op").textContent = fmt(d.op);
+  $("#" + key + "-opunit").textContent = d.op_unit;
+  $("#" + key + "-load").textContent = fmt(d.load, 0);
+
+  // 手/自动按钮状态与软手操可用性
+  const isAuto = d.mode === "auto";
+  $("#" + key + "-btn-auto").classList.toggle("mode-on", isAuto);
+  $("#" + key + "-btn-manu").classList.toggle("mode-on", !isAuto);
+  $("#" + key + "-man-in").disabled = isAuto;
+  $("#" + key + "-man-btn").disabled = isAuto;
+
+  // 参数面板：仅在数值为空时填充，避免打断用户正在编辑的内容
+  for (const p of ["kp", "ti", "td"]) {
+    const el = $("#" + key + "-" + p);
+    if (el.value === "") el.value = fmt(d[p], p === "ti" ? 1 : 2);
+  }
+
+  // 报警徽标
+  const badge = $("#" + key + "-alarm");
+  if (d.alarm_code > 0) {
+    const names = [];
+    if (d.alarm_code & 1) names.push("高限");
+    if (d.alarm_code & 2) names.push("低限");
+    if (d.alarm_code & 4) names.push("偏差");
+    badge.textContent = "报警:" + names.join("/");
+    badge.classList.add("alarm");
+  } else {
+    badge.textContent = "运行正常";
+    badge.classList.remove("alarm");
+  }
+
+  charts[key].setOption(chartOption(d.history, d.op_unit));
+}
+
+function updateAlarms(log) {
+  const tb = $("#alarm-tbody");
+  if (!log || log.length === 0) {
+    tb.innerHTML = '<tr><td colspan="4" style="color:#98a2b3">暂无报警记录</td></tr>';
+    return;
+  }
+  tb.innerHTML = log.map(a =>
+    `<tr class="${a.status === '激活' ? 'st-active' : ''}">
+       <td>${a.time}</td><td>${a.loop}</td><td>${a.type}</td>
+       <td>${a.status}</td></tr>`).join("");
+}
+
+async function refresh() {
+  try {
+    const resp = await fetch("/api/data");
+    const data = await resp.json();
+    $("#banner").style.display = "none";
+    $("#sim-clock").textContent = data.sim_seconds;
+    $("#wall-clock").textContent = data.wall_clock;
+    $("#backend-mode").textContent =
+      data.mode === "modbus"
+        ? "后端：联调模式（Modbus/TCP 主站 → plc_link 从站）"
+        : "后端：单机模式（内置 FOPDT 过程 + 增量式 PID）";
+    for (const key of LOOPS) updateLoopCard(key, data.loops[key]);
+    updateAlarms(data.alarm_log);
+  } catch (err) {
+    $("#banner").style.display = "block";
+  }
+}
+refresh();
+setInterval(refresh, 1000);   // 每秒轮询，与控制周期一致
+</script>
+</body>
+</html>
