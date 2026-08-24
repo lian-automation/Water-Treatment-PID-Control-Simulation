@@ -134,12 +134,6 @@ class PIDController:
         self.td = float(td)
         self.track_t = max(self.td, 10.0 * self.dt)
 
-    def set_limits(self, out_min: float, out_max: float) -> None:
-        """在线修改输出限幅（一般初始化后不变，保留接口便于扩展）。"""
-        self.out_min = float(out_min)
-        self.out_max = float(out_max)
-        self._clamp_op()
-
     # ------------------------------------------------------------------
     # 手动/自动
     # ------------------------------------------------------------------
@@ -279,11 +273,6 @@ class PIDController:
         if value > self.out_max:
             return self.out_max
         return value
-
-    def _clamp_op(self) -> None:
-        """限幅变更后同步收敛内部状态。"""
-        self._op = self._limit(self._op)
-        self._manual_op = self._limit(self._manual_op)
 
 
 # ---------------------------------------------------------------------------

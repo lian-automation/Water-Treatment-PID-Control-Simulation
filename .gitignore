@@ -1,0 +1,16 @@
+# Python 构建产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 虚拟环境
+.venv/
+venv/
+
+# IDE / 编辑器
+.idea/
+.vscode/
+
+# 操作系统杂项
+Thumbs.db
+.DS_Store

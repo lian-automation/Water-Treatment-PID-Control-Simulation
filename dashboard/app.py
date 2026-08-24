@@ -33,15 +33,13 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
 
-from control.pid import MODE_AUTO, MODE_MANUAL, PIDController
-from plc_link.modbus_server import LOOP_CONFIG
+from control.pid import PIDController
+from plc_link.common import (AlarmMonitor, LOOP_CONFIG, LOOP_NAMES,
+                             UNIT_OF_LOOP, alarm_edges)
 from process.plant import build_default_plant
 
 HISTORY_LEN = 500          # 历史缓冲长度（最近 500 点回看）
 DEFAULT_INTERVAL = 1.0     # 控制周期(秒)
-
-# 各回路在 API 中使用的 key 与中文名
-LOOP_NAMES = {"dosing": "加药回路(余氯)", "aeration": "曝气回路(溶解氧)"}
 
 
 class LocalSim:
@@ -64,8 +62,9 @@ class LocalSim:
                     deadband=cfg["deadband"],
                 ),
                 "sp": float(cfg["sp0"]),
-                # 报警延时确认计数器
-                "_t_high": 0, "_t_low": 0, "_t_dev": 0,
+                # 越限延时确认报警器（与从站共用 common.AlarmMonitor）
+                "alm": AlarmMonitor(cfg["high"], cfg["low"],
+                                    cfg["dev"], confirm=5),
                 "alarm_code": 0,
             }
         self.sim_seconds = 0.0
@@ -83,43 +82,21 @@ class LocalSim:
 
     # ------------------------------------------------------------------
     def _eval_alarm(self, key: str) -> int:
-        """报警判断（与从站一致的 5s 延时确认逻辑），返回报警码并在
-        边沿时刻写入报警流水。"""
+        """报警判断（与从站共用的 common.AlarmMonitor 延时确认逻辑），
+        返回报警码并在边沿时刻写入报警流水。"""
         st = self.loops[key]
-        cfg, pv, sp = st["cfg"], st["loop"].true_pv, st["sp"]
+        pv, sp = st["loop"].true_pv, st["sp"]
         code_before = st["alarm_code"]
-        high = low = dev = False
-        if pv > cfg["high"]:
-            st["_t_high"] += 1
-        else:
-            st["_t_high"] = 0
-        if pv < cfg["low"]:
-            st["_t_low"] += 1
-        else:
-            st["_t_low"] = 0
-        if abs(pv - sp) > cfg["dev"]:
-            st["_t_dev"] += 1
-        else:
-            st["_t_dev"] = 0
-        code = (ALM_HIGH if st["_t_high"] >= 5 else 0) \
-             | (ALM_LOW if st["_t_low"] >= 5 else 0) \
-             | (ALM_DEV if st["_t_dev"] >= 5 else 0)
+        code = st["alm"].evaluate(pv, sp)      # 5 拍越限延时确认
         st["alarm_code"] = code
-        # 边沿检测 → 写报警流水（激活/恢复各记一条）
+        # 边沿检测 → 写报警流水（激活/恢复各记一条，共用 alarm_edges）
         now = time.strftime("%H:%M:%S")
-        for bit, name in ((ALM_HIGH, "高限"), (ALM_LOW, "低限"),
-                          (ALM_DEV, "偏差")):
-            was, is_now = code_before & bit, code & bit
-            if is_now and not was:
-                self.alarm_log.appendleft({
-                    "time": now, "loop": LOOP_NAMES[key],
-                    "type": f"PV{name}报警", "status": "激活",
-                })
-            elif was and not is_now:
-                self.alarm_log.appendleft({
-                    "time": now, "loop": LOOP_NAMES[key],
-                    "type": f"PV{name}报警", "status": "恢复",
-                })
+        for bit, name, activated in alarm_edges(code_before, code):
+            self.alarm_log.appendleft({
+                "time": now, "loop": LOOP_NAMES[key],
+                "type": f"PV{name}报警",
+                "status": "激活" if activated else "恢复",
+            })
         return code
 
     def step_once(self) -> None:
@@ -128,11 +105,8 @@ class LocalSim:
             ops = {}
             for key in ("dosing", "aeration"):
                 st = self.loops[key]
-                pv = st["loop"].pv
-                op = st["pid"].update(st["sp"], pv)   # 手动模式下仅跟踪
-                if not st["pid"].is_auto:
-                    op = st["pid"].get_state()["output"]
-                ops[key] = op
+                # update() 自动模式返回 PID 输出、手动模式原样返回手操值
+                ops[key] = st["pid"].update(st["sp"], st["loop"].pv)
             out = self.plant.step(ops["dosing"], ops["aeration"])
             self.sim_seconds += self.interval
             for key in ("dosing", "aeration"):
@@ -227,9 +201,8 @@ try:                                    # pymodbus 缺失时单机模式仍可�
 except ImportError:                     # pragma: no cover
     _HAS_PYMODBUS = False
 
-HR_SP, HR_PV, HR_OP, HR_MODE, HR_ALM, HR_HB = 0, 1, 2, 3, 4, 5
-UNIT_OF_LOOP = {"dosing": 1, "aeration": 2}
-ALM_HIGH, ALM_LOW, ALM_DEV = 1, 2, 4
+# 寄存器地址/Unit 映射与从站同源：单一事实来源在 plc_link/common.py
+from plc_link.common import HR_ALM, HR_HB, HR_MODE, HR_OP, HR_PV, HR_SP
 
 
 class ModbusBridge:
@@ -295,20 +268,15 @@ class ModbusBridge:
                 h["sp"].append(regs[HR_SP] / 100.0)
                 h["pv"].append(regs[HR_PV] / 100.0)
                 h["op"].append(regs[HR_OP] / 100.0)
-                # 报警码边沿 → 流水
+                # 报警码边沿 → 流水（边沿判定共用 common.alarm_edges）
                 alm = regs[HR_ALM]
                 prev = self._prev_alm[key]
                 now = time.strftime("%H:%M:%S")
-                for bit, name in ((ALM_HIGH, "高限"), (ALM_LOW, "低限"),
-                                  (ALM_DEV, "偏差")):
-                    if (alm & bit) and not (prev & bit):
-                        self.alarm_log.appendleft({
-                            "time": now, "loop": LOOP_NAMES[key],
-                            "type": f"PV{name}报警", "status": "激活"})
-                    elif (prev & bit) and not (alm & bit):
-                        self.alarm_log.appendleft({
-                            "time": now, "loop": LOOP_NAMES[key],
-                            "type": f"PV{name}报警", "status": "恢复"})
+                for bit, name, activated in alarm_edges(prev, alm):
+                    self.alarm_log.appendleft({
+                        "time": now, "loop": LOOP_NAMES[key],
+                        "type": f"PV{name}报警",
+                        "status": "激活" if activated else "恢复"})
                 self._prev_alm[key] = alm
         if not ok_all:
             self._connected = False

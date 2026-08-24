@@ -12,9 +12,10 @@ plc_link/modbus_client_test.py —— Modbus/TCP 主站自测脚本
     2) 读 HR0~HR5，检查心跳在增长（从站仿真线程存活）；
     3) PV/OP 寄存器数值在合理范围内（0.01 定标）；
     4) 写 HR0（SP 下发 +10%）→ 回读校验 → 恢复原值；
-    5) 写 HR3=0（切手动）→ 写 HR2 不可行（只读），改为验证模式回读；
-       再写 HR3=1（切回自动）；
-    6) SP 下发后等待若干周期，验证 PV 向新 SP 靠拢（闭环在动）。
+    5) 写 HR3=0（切手动）→ 回读校验；再写 HR3=1（切回自动）；
+    6) SP 下发后等待若干周期，验证 PV 向新 SP 靠拢（闭环在动）；
+    7) 只读写保护离线验证：HR1/HR2/HR4/HR5 外部写被数据块拒绝，
+       内部遥测通道正常，批量写触及只读区时整段拒绝。
 
 用法：
     先启动从站：python -m plc_link.modbus_server --port 5020
@@ -29,11 +30,11 @@ import time
 
 from pymodbus.client import ModbusTcpClient
 
-# 与从站一致的寄存器定义（保持同步修改）
-HR_SP, HR_PV, HR_OP, HR_MODE, HR_ALM, HR_HB = 0, 1, 2, 3, 4, 5
-UNIT_DOSING = 1
-UNIT_AERATION = 2
-UNIT_NAMES = {UNIT_DOSING: "加药回路", UNIT_AERATION: "曝气回路"}
+# 寄存器定义与从站同源：单一事实来源在 plc_link/common.py（评审修复项）
+from plc_link.common import (HR_ALM, HR_HB, HR_MODE, HR_OP, HR_PV, HR_SP,
+                             LOOP_NAMES, N_REGS, READONLY_OFFSETS)
+
+UNIT_NAMES = {1: LOOP_NAMES["dosing"], 2: LOOP_NAMES["aeration"]}
 
 _results: list[tuple[str, bool, str]] = []
 
@@ -70,6 +71,47 @@ def write_reg(client: ModbusTcpClient, unit: int,
             return True
         time.sleep(0.4)
     return False
+
+
+def guard_offline_check() -> None:
+    """只读写保护离线单元验证：直接构造 GuardedDataBlock，不依赖网络。
+
+    覆盖四个语义：
+      ① 外部写只读寄存器（HR1）被拒绝；
+      ② 从站内部通道刷新只读寄存器正常生效；
+      ③ 可写区（HR0/HR3）外部写照常放行；
+      ④ 批量写一旦触及任一只读寄存器则整段拒绝（防"部分写入"污染）。
+    """
+    # 延迟导入：避免在仅做网络测试时拉起整个从站模块
+    from plc_link.modbus_server import GuardedDataBlock
+
+    print("-" * 64)
+    print("只读寄存器写保护：离线构造 GuardedDataBlock 验证")
+    print("-" * 64)
+    block = GuardedDataBlock(0, [0] * N_REGS,
+                             readonly_offsets=READONLY_OFFSETS)
+
+    block.setValues(HR_PV, [999])
+    check("只读保护: 外部写 HR1(PV) 被拒绝",
+          block.getValues(HR_PV, 1)[0] == 0, "写入后仍为初值 0")
+
+    block.write_internal(HR_PV, 12345)
+    check("只读保护: 内部遥测刷新 HR1 生效",
+          block.getValues(HR_PV, 1)[0] == 12345, "0 -> 12345")
+
+    block.setValues(HR_SP, [100])
+    block.setValues(HR_MODE, [1])
+    check("只读保护: 可写区 HR0/HR3 放行",
+          block.getValues(HR_SP, 1)[0] == 100
+          and block.getValues(HR_MODE, 1)[0] == 1,
+          "SP=100 MODE=1")
+
+    block.setValues(HR_MODE, [1, 7, 8])   # HR3~HR5，触及只读的 HR4/HR5
+    rejected = (block.getValues(HR_MODE, 1)[0] == 1
+                and block.getValues(HR_ALM, 1)[0] == 0
+                and block.getValues(HR_HB, 1)[0] == 0)
+    check("只读保护: 批量写触及只读区整段拒绝", rejected,
+          "HR3 保持原值、HR4/HR5 未被写入")
 
 
 def test_unit(client: ModbusTcpClient, unit: int, wait_cycles: int = 8) -> None:
@@ -150,8 +192,9 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        test_unit(client, UNIT_DOSING)
-        test_unit(client, UNIT_AERATION)
+        for unit in sorted(UNIT_NAMES):
+            test_unit(client, unit)
+        guard_offline_check()
     finally:
         client.close()
 

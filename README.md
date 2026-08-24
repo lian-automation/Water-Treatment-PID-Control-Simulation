@@ -81,7 +81,7 @@ pip install -r requirements.txt
 |---|---|---|
 | ①（可选）整定实验 | `python -m tune.tuner` | 生成 `docs/整定对比报告.md` + 曲线页 |
 | ②（可选）Modbus 从站 | `python -m plc_link.modbus_server --port 5020` | 双 Unit 从站，Ctrl+C 退出 |
-| ③（可选）从站自测 | `python -m plc_link.modbus_client_test --port 5020` | 13 项通信测试，退出码 0=全通过 |
+| ③（可选）从站自测 | `python -m plc_link.modbus_client_test --port 5020` | 17 项通信测试，退出码 0=全通过 |
 | ④ Web 看板（单机） | `python -m dashboard.app` | 浏览器打开 http://127.0.0.1:5000 |
 | ④' Web 看板（联调） | `python -m dashboard.app --modbus 127.0.0.1:5020 --port 5001` | 需先执行②，看板经 Modbus 读写从站 |
 | ⑤ 场景测试（核心产出） | `python run_test.py` | 生成 `docs/测试报告.md` + `docs/测试曲线.html` |
@@ -116,8 +116,9 @@ Water-Treatment-PID-Control-Simulation/
 │   └── tuner.py                 两点法辨识 + Z-N 整定 + 参数对比实验
 ├── plc_link/
 │   ├── __init__.py
-│   ├── modbus_server.py         Modbus/TCP 从站（模拟 PLC，双 Unit）
-│   └── modbus_client_test.py    Modbus 主站自测脚本（13 项检查）
+│   ├── modbus_server.py         Modbus/TCP 从站（模拟 PLC，双 Unit，只读写保护）
+│   ├── common.py                寄存器映射/报警逻辑单一事实来源
+│   └── modbus_client_test.py    Modbus 主站自测脚本（17 项检查）
 ├── dashboard/
 │   ├── __init__.py
 │   ├── app.py                   Flask 后端（单机/Modbus 联调双模式）
@@ -162,7 +163,7 @@ Water-Treatment-PID-Control-Simulation/
 
 | 项目 | 结果 |
 |---|---|
-| Modbus 主站自测 | 13/13 项 PASS（含 SP 下发回读、手自动切换、闭环响应、心跳） |
+| Modbus 主站自测 | 17/17 项 PASS（含 SP 下发回读、手自动切换、闭环响应、心跳、只读写保护） |
 | 寄存器地址一致性 | HR0↔地址0 回读写入实测一致（pymodbus 3.6.9 zero_mode） |
 | 看板轮询 | 1 Hz，与控制周期同步；最近 500 点历史回看 |
 

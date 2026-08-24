@@ -86,7 +86,7 @@ def main() -> None:
     md.append("")
     md.append(fmt_row(["回路", "被控量/操作量", "模型 K/T/τ(真值)",
                        "辨识结果(两点法)", "保守参数 Kp/Ti/Td",
-                       "整定参数 Kp/Ti/Td"]))
+                       "整定参数(Z-N工程修正值) Kp/Ti/Td"]))
     md.append("|---|---|---|---|---|---|")
 
     tuned_params: dict[str, dict] = {}

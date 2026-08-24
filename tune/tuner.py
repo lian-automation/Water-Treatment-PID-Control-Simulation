@@ -36,7 +36,6 @@ Z-N 开环整定公式（反应曲线法）：
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 
 import numpy as np
@@ -109,10 +108,8 @@ def identify_fopdt(loop_template: FOPDTLoop,
 
     t28 = cross_time(0.283)
     t63 = cross_time(0.632)
-    t_hat = (t63 - t28) / (math.log(1.0 / (1.0 - 0.283))
-                           - math.log(1.0 / (1.0 - 0.632)))
-    # 说明：上式分母 = ln(1/0.717) - ln(1/0.368) = 0.3327 - (-1.0)? 注意符号，
-    # 化简后等于 0.6673（推导见文件头注释），这里直接给出数值结果。
+    # 两点法解析解：T = (t63-t28)/0.6673，其中 0.6673 = ln(1/0.717) - 0
+    # 的化简结果（=1-ln(1/0.717)，推导见文件头注释），τ = t63 - T
     t_hat = (t63 - t28) / 0.6673
     tau_hat = t63 - t_hat
     # 物理约束：滞后不可能为负

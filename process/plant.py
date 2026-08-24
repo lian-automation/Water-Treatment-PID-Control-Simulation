@@ -103,6 +103,7 @@ class FOPDTLoop:
         self.load_gain = float(load_gain)
         self.load_filter_t = max(float(load_filter_t), 1e-6)
         self.dt = float(dt)
+        self._seed = int(seed)   # 记住初始种子：reset() 后噪声序列可复现
 
         # ---- 运行状态 -------------------------------------------------------
         self._load = float(load0)          # 当前进水负荷(%)
@@ -171,14 +172,15 @@ class FOPDTLoop:
         self.noise_scale = float(scale)
 
     def reset(self) -> None:
-        """复位到初始状态（保留模型参数与随机种子，重新排随机序列）。"""
+        """复位到初始状态（模型参数不变；用初始种子重建随机源，
+        复位后噪声序列与首次运行完全一致，保证实验可复现）。"""
         self._load = 100.0
         self._dist_state = self.load_gain * (self._load - 100.0)
         self._pv_true = self.pv0
         self._pv_meas = self.pv0
         self._sim_time = 0.0
         self.noise_scale = 1.0
-        self._rng = random.Random(abs(hash(self.name)) % (2**32))
+        self._rng = random.Random(self._seed)
         self._op_buf = deque([self.op_min] * (self.delay_steps + 1),
                              maxlen=self.delay_steps + 1)
 
