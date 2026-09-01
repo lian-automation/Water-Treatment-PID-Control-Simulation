@@ -30,21 +30,17 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
-from pathlib import Path
 
 import numpy as np
 
-from plc_link.modbus_server import LOOP_CONFIG
 from process.plant import build_default_plant
-from tune.tuner import (BASELINE_SP, CONSERVATIVE_PARAMS,
-                        DOCS_DIR, ENGINEER_CORRECTION, EVENT_T,
-                        FS_SPAN, LOAD_TOTAL_S, NOISE_TOTAL_S,
-                        SERVO_TOTAL_S, DT,
+from tune.tuner import (CONSERVATIVE_PARAMS, DOCS_DIR,
+                        ENGINEER_CORRECTION, EVENT_T, FS_SPAN,
+                        LOAD_TOTAL_S, NOISE_TOTAL_S, SERVO_TOTAL_S,
                         engineering_correction, identify_fopdt,
                         make_comparison_html, run_closed_loop,
                         ziegler_nichols_open_loop)
 
-PROJECT_ROOT = Path(__file__).resolve().parent
 REPORT_MD = DOCS_DIR / "测试报告.md"
 REPORT_HTML = DOCS_DIR / "测试曲线.html"
 

@@ -19,10 +19,15 @@ plc_link/modbus_server.py —— Modbus/TCP 从站（模拟 PLC）
     HR3  MODE 自/手动    读/写   1=自动 0=手动
     HR4  ALM  报警码     只读    bit0高限/bit1低限/bit2偏差，外部写被拒
     HR5  HB   心跳       只读    每周期 +1 mod 65536，外部写被拒
+    HR8  MVAL 手操值     读/写   ×100，手动模式下生效（评审修复新增：
+        联调模式软手操链路。主站为唯一写方；从站边沿检测——手动模式
+        下寄存器值相对上拍变化时应用，切手动未写值则保持当前输出）
 
 线程模型：
     主线程：StartTcpServer 阻塞服务；
-    后台 daemon 线程：按控制周期(默认 1s)「读给定→运算→刷新遥测」。
+    后台 daemon 线程：按控制周期(默认 1s)「读给定→运算→刷新遥测」，
+    循环体逐拍捕获异常并记录后继续运行（防止一次未预期异常把线程
+    静默杀死、遥测永久冻结——评审修复项）。
     说明：pymodbus 数据区为普通内存对象，本仿真"单写多读"并发在
     CPython GIL 下足够安全；真实工程应使用带锁的数据块。
 
@@ -38,6 +43,7 @@ from __future__ import annotations
 import argparse
 import threading
 import time
+import traceback
 
 from pymodbus.datastore import (ModbusSequentialDataBlock,
                                 ModbusServerContext,
@@ -47,9 +53,9 @@ from pymodbus.server import StartTcpServer
 
 from control.pid import PIDController
 from plc_link.common import (AlarmMonitor, FC_HOLDING, HR_ALM, HR_HB,
-                             HR_MODE, HR_OP, HR_PV, HR_SP, LOOP_CONFIG,
-                             N_REGS, READONLY_OFFSETS, scale_from_reg,
-                             scale_to_reg)
+                             HR_MANUAL, HR_MODE, HR_OP, HR_PV, HR_SP,
+                             LOOP_CONFIG, N_REGS, READONLY_OFFSETS,
+                             scale_from_reg, scale_to_reg)
 from process.plant import build_default_plant
 
 # 兼容旧引用：报警位常量仍可从本模块导入（单一来源在 common）
@@ -83,10 +89,15 @@ class GuardedDataBlock(ModbusSequentialDataBlock):
         super().setValues(address, values)
 
     def write_internal(self, address: int, value: int) -> None:
-        """从站内部遥测写入：不受只读保护限制。"""
+        """从站内部遥测写入：不受只读保护限制。
+
+        写入值钳位到 [0, 65535]（16 位无符号量程）而非回绕取模——
+        遥测越界应饱和显示而不是回绕成假读数（负 PV 回绕缺陷的
+        编码端防护层，评审修复项；心跳在 PLCRuntime 内已按设计取模）。
+        """
         idx = address - self.address
         if 0 <= idx < len(self.values):
-            self.values[idx] = int(value) % 65536
+            self.values[idx] = max(0, min(int(value), 65535))
 
 
 class PLCRuntime:
@@ -114,6 +125,7 @@ class PLCRuntime:
         self.sp = float(cfg["sp0"])
         self.mode_auto = True
         self.manual_op = float(self.loop.op_min)
+        self.last_manual_reg: int | None = None   # HR8 逐拍跟踪基准（None=首拍）
         self.heartbeat = 0
         self.alarm_code = 0
         # 越限延时确认报警器（连续 5 拍越限才置位，逻辑单点在 common）
@@ -191,13 +203,30 @@ def build_context() -> tuple[ModbusServerContext,
 
 
 def sync_regs_to_runtime(slave: ModbusSlaveContext, rt: PLCRuntime) -> None:
-    """从站数据区 -> 运行时：读取上位机写入的 SP 与手/自动模式。"""
+    """从站数据区 -> 运行时：读取上位机写入的 SP、手/自动模式与手操值。
+
+    手操值（HR8）约定（评审修复项——联调模式软手操链路）：
+      * 主站是 HR8 的唯一写方，从站只读不写（无写冲突）；
+      * 从站每拍跟踪 HR8（自动模式下也只更新基准、不应用）；仅在
+        【手动模式且寄存器值相对上拍发生变化】时应用新手操值（边沿
+        触发）——切手动但未写 HR8 时输出保持切换瞬间值（无扰缺省）；
+      * 主站"写 MODE=0 后紧随写 HR8"的常见时序（看板弹窗流程，两笔写
+        落在同一从站拍间隔内）：HR8 相对上一拍的变化在进入手动后的
+        第一拍即被检测并应用；
+      * 已知边界：重写与当前 HR8 完全相同的手操值不产生新边沿（应用
+        不到），此时输出保持当前值，改写任意其它值即可再触发。
+    """
     sp_reg = slave.getValues(FC_HOLDING, HR_SP, count=1)[0]
     mode_reg = slave.getValues(FC_HOLDING, HR_MODE, count=1)[0]
     rt.set_sp(scale_from_reg(sp_reg))
     want_auto = bool(mode_reg == 1)
     if want_auto != rt.mode_auto:
         rt.set_mode(want_auto)
+    man_reg = slave.getValues(FC_HOLDING, HR_MANUAL, count=1)[0]
+    if (not rt.mode_auto and rt.last_manual_reg is not None
+            and man_reg != rt.last_manual_reg):
+        rt.write_manual(scale_from_reg(man_reg))
+    rt.last_manual_reg = man_reg
 
 
 def sync_runtime_to_regs(block: GuardedDataBlock, rt: PLCRuntime) -> None:
@@ -235,14 +264,28 @@ def main() -> None:
         slave.setValues(FC_HOLDING, HR_SP, [scale_to_reg(rt.sp)])
         slave.setValues(FC_HOLDING, HR_MODE, [1])  # 默认自动
 
+    # 仿真线程异常计数（诊断状态：线程内逐拍捕获，不再静默死亡）
+    sim_errors = {"count": 0}
+
     def sim_loop() -> None:
-        """后台仿真线程：每 interval 秒完成一次「收给定→运算→刷遥测」。"""
+        """后台仿真线程：每 interval 秒完成一次「收给定→运算→刷遥测」。
+
+        评审修复项：循环体逐拍 try/except——后台 daemon 线程若裸跑，
+        任何一拍未预期异常都会静默杀死线程，表现为 PV/OP/心跳全部
+        冻结而服务器仍接受连接（"假死"），且唯一线索是心跳停摆。
+        现在异常被记录（含堆栈）并计数后继续运行，瞬态异常不再致命。
+        """
         next_t = time.time()
         while True:
-            for unit, (key, rt) in unit_map.items():
-                sync_regs_to_runtime(slaves[unit], rt)   # 先收上位机给定
-                rt.tick()                                # 推进仿真与控制
-                sync_runtime_to_regs(blocks[unit], rt)   # 内部通道刷遥测
+            try:
+                for unit, (key, rt) in unit_map.items():
+                    sync_regs_to_runtime(slaves[unit], rt)   # 先收上位机给定
+                    rt.tick()                                # 推进仿真与控制
+                    sync_runtime_to_regs(blocks[unit], rt)   # 内部通道刷遥测
+            except Exception:
+                sim_errors["count"] += 1
+                print(f"[plc-sim] 仿真线程异常（第 {sim_errors['count']} 次），"
+                      f"本拍跳过：\n{traceback.format_exc()}", flush=True)
             next_t += args.interval
             sleep_s = next_t - time.time()
             if sleep_s > 0:
@@ -266,6 +309,7 @@ def main() -> None:
     print("  Unit 1 = 加药回路(余氯)   Unit 2 = 曝气回路(溶解氧)")
     print("  寄存器：HR0=SP×100 HR1=PV×100 HR2=OP×100 "
           "HR3=自/手动 HR4=报警码 HR5=心跳")
+    print("  软手操：HR8=手操值×100（主站写，手动模式下边沿生效）")
     print("  只读保护：HR1/HR2/HR4/HR5 的外部写请求被数据块拒绝")
     print("  Ctrl+C 退出")
     print("=" * 64)

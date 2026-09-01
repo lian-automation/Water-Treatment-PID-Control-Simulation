@@ -105,7 +105,7 @@ function buildCards() {
           <button onclick="sendSp('${key}')">SP下发</button></div>
         <div><label>手/自动切换</label>
           <button id="${key}-btn-auto" onclick="sendMode('${key}', true)">自动</button>
-          <button id="${key}-btn-manu" class="gray" onclick="askManual('${key}')">手动</button></div>
+          <button id="${key}-btn-manu" class="gray" onclick="sendMode('${key}', false)">手动</button></div>
         <div><label>软手操 OP</label>
           <input type="number" step="1" id="${key}-man-in" disabled>
           <button id="${key}-man-btn" disabled onclick="sendManual('${key}')">手操下发</button></div>
@@ -170,8 +170,6 @@ async function sendMode(key, auto) {
     await post("/api/mode", { loop: key, auto: true });
   }
 }
-
-function askManual(key) { /* 由 sendMode(false) 处理 */ }
 
 async function sendManual(key) {
   const v = parseFloat($("#" + key + "-man-in").value);

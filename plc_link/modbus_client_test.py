@@ -31,8 +31,9 @@ import time
 from pymodbus.client import ModbusTcpClient
 
 # 寄存器定义与从站同源：单一事实来源在 plc_link/common.py（评审修复项）
-from plc_link.common import (HR_ALM, HR_HB, HR_MODE, HR_OP, HR_PV, HR_SP,
-                             LOOP_NAMES, N_REGS, READONLY_OFFSETS)
+from plc_link.common import (HR_ALM, HR_HB, HR_MANUAL, HR_MODE, HR_OP,
+                             HR_PV, HR_SP, LOOP_NAMES, N_REGS,
+                             READONLY_OFFSETS)
 
 UNIT_NAMES = {1: LOOP_NAMES["dosing"], 2: LOOP_NAMES["aeration"]}
 
@@ -101,10 +102,12 @@ def guard_offline_check() -> None:
 
     block.setValues(HR_SP, [100])
     block.setValues(HR_MODE, [1])
-    check("只读保护: 可写区 HR0/HR3 放行",
+    block.setValues(HR_MANUAL, [3500])   # HR8 手操值：可写区（评审修复新增）
+    check("只读保护: 可写区 HR0/HR3/HR8 放行",
           block.getValues(HR_SP, 1)[0] == 100
-          and block.getValues(HR_MODE, 1)[0] == 1,
-          "SP=100 MODE=1")
+          and block.getValues(HR_MODE, 1)[0] == 1
+          and block.getValues(HR_MANUAL, 1)[0] == 3500,
+          "SP=100 MODE=1 MVAL=3500")
 
     block.setValues(HR_MODE, [1, 7, 8])   # HR3~HR5，触及只读的 HR4/HR5
     rejected = (block.getValues(HR_MODE, 1)[0] == 1

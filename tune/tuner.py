@@ -40,8 +40,8 @@ from pathlib import Path
 
 import numpy as np
 
-from control.pid import PIDController
-from process.plant import FOPDTLoop, ProcessPlant, build_default_plant
+from control.pid import N_FILT, PIDController
+from process.plant import FOPDTLoop, build_default_plant
 
 # ---------------------------------------------------------------------------
 # 实验公共配置
@@ -156,7 +156,8 @@ def run_closed_loop(loop_key: str,
                     scenario_type: str,
                     total_s: int,
                     event_t: int = EVENT_T,
-                    quiet_noise: bool = False) -> dict:
+                    quiet_noise: bool = False,
+                    deriv_filt_n: float | None = None) -> dict:
     """在单一回路上跑一段闭环实验并记录全部曲线。
 
     参数：
@@ -167,6 +168,8 @@ def run_closed_loop(loop_key: str,
         total_s        总仿真时长(s)
         event_t        事件发生时刻(s)
         quiet_noise    True 时关闭测量噪声（用于隔离扰动动力学的对照试验）
+        deriv_filt_n   不完全微分系数 N（None=用模块默认 N_FILT）；
+                       供 N=5 vs N=2 对照实验按实例注入，不改源码
     返回：
         dict(t[], sp[], pv_meas[], pv_true[], op[], metrics{}, meta{})
     """
@@ -181,9 +184,11 @@ def run_closed_loop(loop_key: str,
     loop = getattr(plant, loop_key)
     sp = BASELINE_SP[loop_key]
     deadband = 0.005 if loop_key == "dosing" else 0.01
+    n_filt = N_FILT if deriv_filt_n is None else float(deriv_filt_n)
     pid = PIDController(
         kp=pid_params["kp"], ti=pid_params["ti"], td=pid_params["td"],
         dt=DT, out_min=loop.op_min, out_max=loop.op_max, deadband=deadband,
+        deriv_filt_n=n_filt,
     )
 
     n = int(total_s / DT)
@@ -230,7 +235,7 @@ def run_closed_loop(loop_key: str,
             "pid_params": dict(pid_params), "event_t": event_t,
             "baseline_sp": BASELINE_SP[loop_key],
             "fs_span": FS_SPAN[loop_key], "pv_unit": loop.pv_unit,
-            "op_unit": loop.op_unit,
+            "op_unit": loop.op_unit, "deriv_filt_n": n_filt,
         },
     }
 
@@ -417,7 +422,54 @@ def run_comparison() -> list[dict]:
     return results
 
 
-def write_reports(results: list[dict]) -> tuple[Path, Path]:
+# ---------------------------------------------------------------------------
+# ③b 不完全微分系数 N 对照实验（评审修复项：为文档声明补可复现数据工件）
+# ---------------------------------------------------------------------------
+def run_nfilt_comparison() -> list[dict]:
+    """N=5 vs N=2 对照实验：两回路 × (伺服 / 噪声×5) × N∈{5,2}。
+
+    背景：文档此前引用"N=5 vs N=2 波动降约 70%~75%"但未留存实验数据。
+    本函数用项目自带仿真真实跑一遍对照（N 经 PIDController 构造参数
+    deriv_filt_n 注入），结果由 write_reports 写入整定对比报告附录，
+    生成命令：python -m tune.tuner。
+    对照组参数：各回路 Z-N 工程修正值（强整定下微分噪声放大最明显，
+    N 的作用最有区分度）。
+    """
+    plant_tpl = build_default_plant()
+    rows: list[dict] = []
+    for loop_key in ("dosing", "aeration"):
+        tpl = getattr(plant_tpl, loop_key)
+        ident_seconds = 1200.0 if loop_key == "dosing" else 900.0
+        ident = identify_fopdt(tpl, op_step_frac=0.4,
+                               ident_seconds=ident_seconds)
+        zn = ziegler_nichols_open_loop(ident["k_hat"], ident["t_hat"],
+                                       ident["tau_hat"])
+        params = engineering_correction(zn)
+        for scenario, total_s in (("servo", SERVO_TOTAL_S),
+                                  ("noise", NOISE_TOTAL_S)):
+            for n_val in (5.0, 2.0):
+                run = run_closed_loop(loop_key, params, scenario, total_s,
+                                      EVENT_T, deriv_filt_n=n_val)
+                m = run["metrics"]
+                rows.append({
+                    "loop_key": loop_key,
+                    "loop": tpl.name,
+                    "op_unit": tpl.op_unit,
+                    "scenario": scenario,
+                    "n": n_val,
+                    "params": dict(params),
+                    "overshoot": m.get("overshoot_pct_of_step", 0.0),
+                    "settling_s": m["settling_s"],
+                    "op_std": float(np.std(run["op"][EVENT_T:])),
+                    "iae": m["iae"],
+                    "iae_true": m["iae_true"],
+                    "max_dev_pct_fs": abs(m["max_dev_signed"]) / FS_SPAN[loop_key] * 100.0,
+                })
+    return rows
+
+
+def write_reports(results: list[dict],
+                  nfilt_rows: list[dict] | None = None) -> tuple[Path, Path]:
     """把对比实验结果写成 Markdown 报告 + ECharts 曲线页。"""
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
     md_path = DOCS_DIR / "整定对比报告.md"
@@ -483,6 +535,56 @@ def write_reports(results: list[dict]) -> tuple[Path, Path]:
         md.append(f"对比曲线见 `{html_path.name}`。")
         md.append("")
 
+    # ---- 附录：N=5 vs N=2 对照实验（评审修复项，数据由本脚本实测生成）----
+    if nfilt_rows:
+        md.append("## 附录：不完全微分系数 N=5 vs N=2 对照实验（仿真验证值）")
+        md.append("")
+        md.append("> 本附录由 `python -m tune.tuner` 自动生成（评审修复记录："
+                  "文档此前引用 N 对照实验但无数据工件留存，现已补齐并使 N 可经 "
+                  "`PIDController(deriv_filt_n=...)` 按实例配置）。对照组参数为"
+                  "各回路 Z-N 工程修正值（强整定下微分噪声放大最明显）；"
+                  "场景：设定值阶跃 +10% 与测量噪声×5，事件时刻 600s。")
+        md.append("")
+        for loop_key in ("dosing", "aeration"):
+            rows = [r for r in nfilt_rows if r["loop_key"] == loop_key]
+            if not rows:
+                continue
+            md.append(f"### {rows[0]['loop']}（N 经构造参数注入，"
+                      f"Kp={rows[0]['params']['kp']:.2f} / "
+                      f"Ti={rows[0]['params']['ti']:.1f}s / "
+                      f"Td={rows[0]['params']['td']:.2f}s）")
+            md.append("")
+            md.append("| 场景 | N | 超调(%) | 调节时间(s) | OP动作强度"
+                      f"({rows[0]['op_unit']}) | IAE | IAE(真值) | 最大偏差(%FS) |")
+            md.append("|---|---|---|---|---|---|---|---|")
+            for r in rows:
+                md.append(
+                    f"| {r['scenario']} | {r['n']:.0f} "
+                    f"| {r['overshoot']:.1f} | {r['settling_s']:.0f} "
+                    f"| {r['op_std']:.2f} | {r['iae']:.2f} "
+                    f"| {r['iae_true']:.2f} | {r['max_dev_pct_fs']:.2f} |")
+            md.append("")
+            # 自动生成对比结论（按噪声场景 N=2 相对 N=5 的变化率）
+            for scenario in ("noise", "servo"):
+                r5 = next((r for r in rows if r["scenario"] == scenario
+                           and r["n"] == 5.0), None)
+                r2 = next((r for r in rows if r["scenario"] == scenario
+                           and r["n"] == 2.0), None)
+                if not (r5 and r2):
+                    continue
+                def _pct(a: float, b: float) -> str:
+                    return f"{(b - a) / a * 100:+.0f}%" if a else "n/a"
+                name = {"servo": "伺服(SP+10%)", "noise": "噪声×5"}[scenario]
+                md.append(
+                    f"- **{name}**：N=2 相比 N=5，OP 动作强度 "
+                    f"{r5['op_std']:.2f}→{r2['op_std']:.2f}"
+                    f"{rows[0]['op_unit']}（{_pct(r5['op_std'], r2['op_std'])}），"
+                    f"IAE(真值) {r5['iae_true']:.2f}→{r2['iae_true']:.2f}"
+                    f"（{_pct(r5['iae_true'], r2['iae_true'])}），"
+                    f"超调 {r5['overshoot']:.1f}%→{r2['overshoot']:.1f}%，"
+                    f"调节时间 {r5['settling_s']:.0f}s→{r2['settling_s']:.0f}s。")
+            md.append("")
+
     md_path.write_text("\n".join(md), encoding="utf-8")
     make_comparison_html(
         title="PID 参数整定对比曲线（默认保守 vs Z-N 整定，仿真验证值）",
@@ -499,7 +601,8 @@ def write_reports(results: list[dict]) -> tuple[Path, Path]:
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     res = run_comparison()
-    md_path, html_path = write_reports(res)
+    nfilt = run_nfilt_comparison()
+    md_path, html_path = write_reports(res, nfilt_rows=nfilt)
     print("=" * 78)
-    print(f"已生成报告：{md_path}")
+    print(f"已生成报告：{md_path}（含 N=5 vs N=2 对照实验附录）")
     print(f"已生成曲线：{html_path}（浏览器打开，ECharts 经 CDN 加载）")

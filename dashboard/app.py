@@ -34,8 +34,9 @@ from pathlib import Path
 from flask import Flask, jsonify, render_template, request
 
 from control.pid import PIDController
-from plc_link.common import (AlarmMonitor, LOOP_CONFIG, LOOP_NAMES,
-                             UNIT_OF_LOOP, alarm_edges)
+from plc_link.common import (AlarmMonitor, HR_ALM, HR_HB, HR_MANUAL,
+                             HR_MODE, HR_OP, HR_PV, HR_SP, LOOP_CONFIG,
+                             LOOP_NAMES, UNIT_OF_LOOP, alarm_edges)
 from process.plant import build_default_plant
 
 HISTORY_LEN = 500          # 历史缓冲长度（最近 500 点回看）
@@ -78,6 +79,9 @@ class LocalSim:
             for key in ("dosing", "aeration")
         }
         self.alarm_log: deque = deque(maxlen=100)   # 报警事件流水
+        # 后台线程诊断状态（评审修复项：线程逐拍捕获异常，不再静默死亡）
+        self.step_errors = 0
+        self.last_error: str | None = None
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -119,10 +123,22 @@ class LocalSim:
                 self._eval_alarm(key)
 
     def run_forever(self) -> None:
-        """后台仿真线程主循环（实时节拍）。"""
+        """后台仿真线程主循环（实时节拍）。
+
+        评审修复项：逐拍 try/except——后台线程若裸跑，step_once 一次
+        未预期异常就会静默死亡，看板数据永久冻结且无告警（原先与
+        ModbusBridge.run_forever 的异常保护纪律不一致）。现在异常被
+        记录到 last_error/step_errors 并打印后继续运行。
+        """
         next_t = time.time()
         while True:
-            self.step_once()
+            try:
+                self.step_once()
+            except Exception as exc:            # 保持线程存活，仅跳过本拍
+                self.step_errors += 1
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                print(f"[LocalSim] 仿真线程异常（第 {self.step_errors} 次），"
+                      f"本拍跳过：{self.last_error}", flush=True)
             next_t += self.interval
             delay = next_t - time.time()
             if delay > 0:
@@ -201,15 +217,13 @@ try:                                    # pymodbus 缺失时单机模式仍可�
 except ImportError:                     # pragma: no cover
     _HAS_PYMODBUS = False
 
-# 寄存器地址/Unit 映射与从站同源：单一事实来源在 plc_link/common.py
-from plc_link.common import HR_ALM, HR_HB, HR_MODE, HR_OP, HR_PV, HR_SP
-
 
 class ModbusBridge:
     """联调模式后端：轮询从站寄存器并维护同样的历史/报警结构。
 
-    说明：SP 与手/自动通过寄存器下发；PID 参数不在标准寄存器表内，
-    change_tuning 返回错误提示（真实工程需扩展寄存器表或专用功能码）。
+    说明：SP、手/自动与手操值（HR8）通过寄存器下发；PID 参数不在
+    标准寄存器表内，change_tuning 返回错误提示（真实工程需扩展
+    寄存器表或专用功能码）。
     """
 
     def __init__(self, host: str, port: int,
@@ -348,10 +362,20 @@ class ModbusBridge:
         self._write(UNIT_OF_LOOP[key], HR_SP, int(round(value * 100)))
 
     def set_mode(self, key: str, auto: bool, manual_op: float | None = None) -> None:
-        self._write(UNIT_OF_LOOP[key], HR_MODE, 1 if auto else 0)
+        unit = UNIT_OF_LOOP[key]
+        ok = self._write(unit, HR_MODE, 1 if auto else 0)
+        # 评审修复项：切手动的初始手操值此前被静默丢弃（UI 询问形同虚设）。
+        # 现在切手动后把手操初值写入 HR8（从站在手动模式下边沿生效）；
+        # 未给初值时从站保持切换瞬间输出（无扰缺省）。
+        if ok and not auto and manual_op is not None:
+            self._write(unit, HR_MANUAL, int(round(float(manual_op) * 100)))
 
     def write_manual(self, key: str, op: float) -> None:
-        raise RuntimeError("联调模式：OP 为从站计算结果，只读")
+        """软手操：写 HR8 手操值寄存器（从站仅在手动模式下应用）。"""
+        regs = self.last_regs.get(key)
+        if regs is not None and regs[HR_MODE] == 1:
+            raise RuntimeError("自动模式下不能软手操，请先切手动")
+        self._write(UNIT_OF_LOOP[key], HR_MANUAL, int(round(float(op) * 100)))
 
     def change_tuning(self, key: str, kp: float, ti: float, td: float) -> None:
         raise RuntimeError("联调模式：标准寄存器表无 P/I/D 参数区，"

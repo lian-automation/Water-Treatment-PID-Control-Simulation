@@ -22,7 +22,9 @@ process/plant.py —— 水处理过程对象模型（FOPDT 仿真）
         a = exp(-dt / T)
         PV[k+1] = a * PV[k] + (1 - a) * (K * OP[k - round(tau/dt)] + D[k])
     测量噪声：
-        PV_meas = PV_true + N(0, noise_std)   （高斯白噪声，模拟仪表测量误差）
+        PV_meas = max(PV_true + N(0, noise_std), pv_floor)
+        （高斯白噪声，模拟仪表测量误差；叠加后再做量程下限截断，
+        保证测量读数不出现物理上不可能的负值）
 
 外部接口：
     loop.step(op)              单步推进 dt 秒，返回叠加噪声后的测量 PV
@@ -132,7 +134,8 @@ class FOPDTLoop:
             1) 操作量限幅到物理范围并压入滞后队列；
             2) 负荷扰动项经一阶滤波逼近其稳态影响；
             3) 一阶惯性环节按指数保持离散递推；
-            4) 叠加高斯测量噪声后作为仪表读数返回。
+            4) 叠加高斯测量噪声并做测量下限截断后作为仪表读数返回
+              （截断在噪声之后——测量读数物理上不可能低于量程下限）。
         """
         # 1) OP 限幅 + 纯滞后
         op_clamped = min(max(op, self.op_min), self.op_max)
@@ -153,9 +156,13 @@ class FOPDTLoop:
         if self._pv_true < self.pv_floor:
             self._pv_true = self.pv_floor
 
-        # 4) 测量噪声
+        # 4) 测量噪声 + 测量下限截断
+        # 注意截断次序（代码评审修复项）：噪声必须先叠加、再做下限截断。
+        # 若先截断真值再叠噪声，冷启动 PV≈0 时约半数测量值为负，经 ×100
+        # 定标写入 16 位无符号寄存器会回绕成 655+ mg/L 的假尖峰。
+        # 仪表读数物理上非负（浓度/溶解氧），故测量端截断到 pv_floor。
         noise = self._rng.gauss(0.0, self.noise_std) * self.noise_scale
-        self._pv_meas = self._pv_true + noise
+        self._pv_meas = max(self._pv_true + noise, self.pv_floor)
         self._sim_time += self.dt
         return self._pv_meas
 
