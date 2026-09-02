@@ -165,7 +165,7 @@ Water-Treatment-PID-Control-Simulation/
 
 | 项目 | 结果 |
 |---|---|
-| Modbus 主站自测 | 17/17 项 PASS（含 SP 下发回读、手自动切换、闭环响应、心跳、只读写保护） |
+| Modbus 主站自测 | 17/17 项 PASS（含 SP 下发回读、手自动切换、闭环响应、心跳、只读写保护）。"闭环响应"判据已改为 **OP 对 SP 阶跃的即时响应**（旧 8s PV 观察窗落在加药回路 τ=30s 纯滞后死区内、不可复现，详见 `plc_link/modbus_client_test.py` 模块注释与验收清单 5C）；冷启动连跑 5 次 + 同从站预热复跑 2 次全部通过。复跑命令：先 `python -m plc_link.modbus_server --port 5020`，另开终端 `python -m plc_link.modbus_client_test --port 5020`，退出码 0=全通过 |
 | 寄存器地址一致性 | HR0↔地址0 回读写入实测一致（pymodbus 3.6.9 zero_mode） |
 | 看板轮询 | 1 Hz，与控制周期同步；最近 500 点历史回看 |
 

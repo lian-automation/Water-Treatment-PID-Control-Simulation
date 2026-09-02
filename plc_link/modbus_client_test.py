@@ -11,11 +11,43 @@ plc_link/modbus_client_test.py —— Modbus/TCP 主站自测脚本
     1) 连接从站（Unit1=加药、Unit2=曝气）；
     2) 读 HR0~HR5，检查心跳在增长（从站仿真线程存活）；
     3) PV/OP 寄存器数值在合理范围内（0.01 定标）；
-    4) 写 HR0（SP 下发 +10%）→ 回读校验 → 恢复原值；
-    5) 写 HR3=0（切手动）→ 回读校验；再写 HR3=1（切回自动）；
-    6) SP 下发后等待若干周期，验证 PV 向新 SP 靠拢（闭环在动）；
+    4) 写 HR3=0（切手动）→ 回读校验；再写 HR3=1（切回自动）；
+    5) 写 HR0（SP 下调 30% 阶跃）→ 回读校验（原值在判据完成后恢复）；
+    6) SP 下调阶跃后控制器输出 OP 必须即时下降（"闭环在调"判据）；
     7) 只读写保护离线验证：HR1/HR2/HR4/HR5 外部写被数据块拒绝，
        内部遥测通道正常，批量写触及只读区时整段拒绝。
+    注意 4)/5) 的先后次序不可颠倒：SP 阶跃必须发生在自动模式下且
+    其后无手动保持——若阶跃写后紧跟切手动，从站下一拍落在手动
+    "输出保持"里，比例增量被无扰切换吞掉（e1 在手动期间照常前移），
+    OP 判据只能看到积分回拉（实机实测 Δ=+2.09 假FAIL，教训已固化
+    为本时序约定）。
+
+"闭环在调"判据说明（复审修补，对应复审报告 03 之 R2-P1-1）：
+    旧判据为"SP 下发 +10% 后等 8s，PV 向新 SP 靠拢"。加药回路
+    τ=30s、T=120s，8s 观察窗落在过程纯滞后死区内，PV 尚未启动
+    响应，判据实际在比较两个独立噪声采样（σ=0.02）到 SP 的距离，
+    通过与否接近掷硬币——复审对真实从站实测 3 次运行 2 次加药
+    FAIL、1 次双回路 FAIL，而 60s 轨迹探针证明回路本身在调
+    （PV 1.06→1.72），问题在判据窗口不在控制回路。
+    新判据改验控制器输出 OP 对 SP 阶跃的响应：
+      * 即时性：增量式 PID 的比例增量 dP = Kp×(e[k]-e[k-1]) 与 SP
+        阶跃同拍生效，不经过过程滞后（PV 要等 τ+T 才动，OP 当拍
+        就动），观察窗 3s + 3 次采样即可确定性地覆盖；
+      * 幅度确定性：SP 下调 30% 时比例增量 ≈ -Kp×30%×SP ≈ -9.3%
+        （加药）/ -24 Hz（曝气）。阶跃取下调 30% 而非 ±10%，是因
+        为冷启动时控制器处于深饱和/大误差工况（曝气 OP 顶格 50Hz，
+        加药 OP≈32% 爬坡中），积分项以 Kp/Ti×e 的速率把 OP 往回
+        拉，±10% 小阶跃的 OP 响应会在观察窗内被积分回拉吞掉
+        （离线仿真实测 Δ 仅 -0.6~-1.6，与阈值同量级）；
+      * 抗噪声：OP 单拍抖动来自 Kp 对测量噪声的放大（单拍 σ≈1.5~
+        2.5），判据取基准/响应窗口各 3 次采样（间隔 1s）的均值差，
+        阈值 OP_DELTA_MIN=2.5 为执行器量化步长（0.01，寄存器
+        1 LSB）的 250 倍；离线压测（冷启动/预热 × 双回路 × 400 次，
+        调度抖动 ±0.5 拍 + 随机噪声种子）最坏组最小响应 -3.9、
+        0 次误判；实机冷启动连跑 5 次全过（记录见 docs/验收清单 5C）；
+      * 方向性：SP 下调，OP 均值必须下降 ≥ 阈值——排除噪声单向
+        上偏造成的假通过；若从站控制线程停摆（OP 冻结），Δ≈0 必判
+        FAIL，判据保有甄别力。
 
 用法：
     先启动从站：python -m plc_link.modbus_server --port 5020
@@ -36,6 +68,15 @@ from plc_link.common import (HR_ALM, HR_HB, HR_MANUAL, HR_MODE, HR_OP,
                              READONLY_OFFSETS)
 
 UNIT_NAMES = {1: LOOP_NAMES["dosing"], 2: LOOP_NAMES["aeration"]}
+
+# ---- "闭环在调"OP 响应判据参数（复审修补 R2-P1-1，依据见模块 docstring）----
+SP_STEP_FRAC = 0.30    # SP 下调阶跃幅度（30%）：保证冷启动深饱和工况下
+                       # OP 响应幅度（≥Kp×30%×SP）远大于积分回拉与噪声
+OP_BASE_SAMPLES = 3    # 基准窗口采样数（SP 阶跃前，间隔 1s=控制周期）
+OP_RESP_SAMPLES = 3    # 响应窗口采样数（阶跃沉降后，间隔 1s）
+OP_SETTLE_S = 3.0      # 阶跃后沉降等待（覆盖从站 2~3 个控制周期）
+OP_DELTA_MIN = 2.5     # OP 均值下降阈值（工程单位 %/Hz；寄存器 250 LSB，
+                       # 为执行器量化步长 0.01 的 250 倍）
 
 _results: list[tuple[str, bool, str]] = []
 
@@ -117,7 +158,7 @@ def guard_offline_check() -> None:
           "HR3 保持原值、HR4/HR5 未被写入")
 
 
-def test_unit(client: ModbusTcpClient, unit: int, wait_cycles: int = 8) -> None:
+def test_unit(client: ModbusTcpClient, unit: int) -> None:
     """对单个从站单元执行全部测试项。"""
     name = UNIT_NAMES[unit]
     print("-" * 64)
@@ -141,16 +182,17 @@ def test_unit(client: ModbusTcpClient, unit: int, wait_cycles: int = 8) -> None:
     check(f"{name}: PV/OP 在合理范围", 0 <= pv <= 1000 and 0 <= op <= 10000,
           f"PV={pv/100:.2f} OP={op/100:.2f}")
 
-    # 3) SP 下发 +10% 并回读
-    sp_old = regs1[HR_SP]
-    sp_new = int(round(sp_old * 1.10))
-    w_ok = write_reg(client, unit, HR_SP, sp_new)
-    back = read_regs(client, unit)
-    check(f"{name}: 写 HR0(SP) 回读一致",
-          w_ok and back is not None and back[HR_SP] == sp_new,
-          f"{sp_old/100:.2f} -> {sp_new/100:.2f}")
+    # 3) OP 基准采样：SP 阶跃前与 regs1 共采 3 次（间隔 1s=控制周期），
+    #    取均值压噪（单点 OP 抖动 σ≈1.5~2.5，见模块 docstring 判据说明）
+    op_base = [regs1[HR_OP] / 100.0]
+    for _ in range(OP_BASE_SAMPLES - 1):
+        time.sleep(1.0)
+        r = read_regs(client, unit)
+        if r is not None:
+            op_base.append(r[HR_OP] / 100.0)
+    op_base_mean = sum(op_base) / len(op_base)
 
-    # 4) 模式切换：手动 -> 回读 -> 自动
+    # 4) 模式切换：手动 -> 回读 -> 自动（须先于 SP 阶跃，时序约定见 docstring）
     ok_w = write_reg(client, unit, HR_MODE, 0)
     m_regs = read_regs(client, unit)
     m0 = m_regs[HR_MODE] if m_regs else -1
@@ -160,20 +202,36 @@ def test_unit(client: ModbusTcpClient, unit: int, wait_cycles: int = 8) -> None:
     check(f"{name}: 手/自动模式写入回读", ok_w and ok_w2 and m0 == 0 and m1 == 1,
           f"手动回读={m0} 自动回读={m1}")
 
-    # 5) 闭环验证：等待若干周期后 PV 应向新 SP 靠拢
-    print(f"  ... 等待 {wait_cycles}s 观察闭环响应")
-    time.sleep(wait_cycles)
-    regs2 = read_regs(client, unit)
-    pv_before = regs1[HR_PV] / 100.0
-    pv_after = regs2[HR_PV] / 100.0
-    sp_target = sp_new / 100.0
-    dist_before = abs(pv_before - sp_target)
-    dist_after = abs(pv_after - sp_target)
-    check(f"{name}: PV 向新 SP 靠拢(闭环在调)",
-          dist_after < dist_before or abs(pv_after - sp_target) < 0.05,
-          f"PV {pv_before:.2f}->{pv_after:.2f}, SP={sp_target:.2f}")
+    # 5) SP 下发：下调 30% 阶跃并回读（自动模式下生效；恢复在判据之后）
+    sp_old = regs1[HR_SP]
+    sp_new = int(round(sp_old * (1 - SP_STEP_FRAC)))
+    w_ok = write_reg(client, unit, HR_SP, sp_new)
+    back = read_regs(client, unit)
+    check(f"{name}: 写 HR0(SP 下调{SP_STEP_FRAC:.0%}) 回读一致",
+          w_ok and back is not None and back[HR_SP] == sp_new,
+          f"{sp_old/100:.2f} -> {sp_new/100:.2f}")
 
-    # 6) 恢复原始 SP
+    # 6) 闭环验证：SP 下调阶跃后 OP 必须即时下降（判据说明见模块 docstring）
+    print(f"  ... 等待 {OP_SETTLE_S:.0f}s 后采样 OP 响应"
+          f"（{OP_RESP_SAMPLES} 次，间隔 1s）")
+    time.sleep(OP_SETTLE_S)
+    op_resp: list[float] = []
+    for i in range(OP_RESP_SAMPLES):
+        r = read_regs(client, unit)
+        if r is not None:
+            op_resp.append(r[HR_OP] / 100.0)
+        if i < OP_RESP_SAMPLES - 1:
+            time.sleep(1.0)
+    op_resp_mean = (sum(op_resp) / len(op_resp)) if op_resp else float("nan")
+    delta = op_resp_mean - op_base_mean
+    check(f"{name}: SP 阶跃后 OP 即时响应(闭环在调)",
+          len(op_base) == OP_BASE_SAMPLES
+          and len(op_resp) == OP_RESP_SAMPLES
+          and delta <= -OP_DELTA_MIN,
+          f"OP均值 {op_base_mean:.2f} -> {op_resp_mean:.2f}"
+          f"（Δ={delta:+.2f}，判据 Δ≤-{-OP_DELTA_MIN}，SP→{sp_new/100:.2f}）")
+
+    # 7) 恢复原始 SP
     write_reg(client, unit, HR_SP, sp_old)
     print(f"  已恢复 SP={sp_old/100:.2f}")
 
