@@ -1,5 +1,9 @@
 # 水处理加药/曝气回路 PID 控制仿真
 
+[![CI](https://github.com/lwj15089590118/Water-Treatment-PID-Control-Simulation/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lwj15089590118/Water-Treatment-PID-Control-Simulation/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green.svg)
+
 > 求职作品集项目 · Windows 10 + Python 3.12 · 仅用 numpy / flask / pymodbus + ECharts(CDN)
 >
 > ⚠️ **免责声明**：本项目所有受控过程为 FOPDT 数学模型仿真，所有模型参数为
@@ -104,9 +108,15 @@ pip install -r requirements.txt
 
 ```text
 Water-Treatment-PID-Control-Simulation/
+├── .github/
+│   └── workflows/
+│       └── ci.yml               CI：compileall + 回归用例 + Modbus 主站 17 项自测
+├── LICENSE                      MIT 许可证
 ├── README.md                    本文件
 ├── requirements.txt             依赖清单
 ├── run_test.py                  三大场景测试 → 自动生成测试报告（核心产出）
+├── tests/
+│   └── test_wraparound.py       负 PV 寄存器回绕回归用例（7 项，unittest）
 ├── process/
 │   ├── __init__.py
 │   └── plant.py                 FOPDT 双回路过程模型（含扰动注入/噪声）
@@ -126,6 +136,9 @@ Water-Treatment-PID-Control-Simulation/
 │   ├── app.py                   Flask 后端（单机/Modbus 联调双模式）
 │   └── templates/index.html     ECharts 看板单页
 ├── docs/
+│   ├── img/
+│   │   ├── scenario_curves.png    场景①②对比曲线（run_test.py 同源仿真数据渲染）
+│   │   └── tuning_comparison.png  三组整定参数对比（tuner 同源仿真数据渲染）
 │   ├── 系统设计说明书.md         建模依据/抗饱和原理/整定计算过程
 │   ├── 组态点表.md               AI/AO/DI/DO 点表 + Modbus 映射
 │   ├── 测试报告.md               run_test.py 自动生成（仿真验证值）
@@ -188,6 +201,7 @@ Water-Treatment-PID-Control-Simulation/
 ```powershell
 python -m process.plant        # FOPDT 开环阶跃自检（稳态 vs 解析值）
 python -m control.pid          # PID 闭环/抗饱和/无扰切换自检
+python -m unittest discover -s tests   # 回归用例（负 PV 回绕，7 项）
 python -m tune.tuner           # 辨识 + Z-N + 三组参数对比 + 报告生成
 python -m plc_link.modbus_server --port 5020    # 从站
 python -m plc_link.modbus_client_test --port 5020  # 主站自测（另开终端）
@@ -208,7 +222,53 @@ python run_test.py             # 三场景测试 + 报告
   （超调 121.8%、调节时间 1095 s）；
 - Modbus 主站多线程共享连接必须加锁，否则事务 ID 错乱（实测踩坑）。
 
-## 9. License / 用途声明
+## 9. 运行曲线（同源仿真数据）
 
-仅用于学习与求职作品集展示。转载或二次使用请保留本声明。
+![场景对比曲线](docs/img/scenario_curves.png)
+
+*场景① SP 阶跃 +10% 与场景② 进水负荷阶跃 +30%（保守参数 vs Z-N 工程修正参数，PV 真值口径，事件时刻 600s）。曲线数据由项目自身闭环仿真 `tune.tuner.run_closed_loop` 离线生成，与 `python run_test.py` 再生的交互版 `docs/测试曲线.html` 同源同参。*
+
+![整定参数对比](docs/img/tuning_comparison.png)
+
+*默认保守参数 vs Z-N 原始建议值 vs Z-N 工程修正值（场景①，双回路）。Z-N 原始值明显过激——曝气回路实测临界稳定（超调 121.8%、调节时间 1095 s），必须工程修正后方可采用；交互版曲线：`docs/整定对比曲线.html`（`python -m tune.tuner` 再生）。*
+
+## 10. FAQ（复审高频追问）
+
+**Q1：负 PV 寄存器回绕是怎么防的？**
+
+三层防护：① 过程模型测量端"先叠加噪声、后做下限截断"（根因层）；② 定标函数 `scale_to_reg` 结果钳位到 [0, 65535]（编码端）；③ 从站 `write_internal` 钳位而非 %65536 取模（寄存器边界）。该缺陷与修复由 `tests/test_wraparound.py` 7 项用例锁定；修复对照实验（300 种子 × 前 5 拍 × 双回路）：旧码负 PV 49.9%、回绕假读数 41.8%（-0.0234 → 65534 → 显示 655+ mg/L），新码 0%。
+
+**Q2：为什么用增量式 PID 而不是位置式？**
+
+增量式固有抗积分饱和：输出增量始终累加在"上拍已限幅输出"上，退出饱和无拖尾；且天然利于手/自动无扰切换与参数在线修改。关键实现细节：微分增量必须取**相邻两拍微分位置值之差**——直接累加微分位置值等效于多串一个积分器，本项目实测会导致闭环发散振荡（README §8）。
+
+**Q3：手/自动是怎么做到无扰切换的？**
+
+切手动瞬间输出保持切换前当前值（看板弹窗默认手操值 = 当前输出）；手动值经 HR8 寄存器**边沿生效**（重写同值不重复应用，防上位机重试造成输出跳变）；切回自动时控制器从当前输出状态继续，实测 OP 35 → 32.16% 平滑接管、无跳变。另有时序约定：SP 阶跃验证必须在自动模式下进行——阶跃后紧跟切手动，比例增量会被无扰切换的"输出保持"吞掉（教训固化于 `plc_link/modbus_client_test.py` 模块注释）。
+
+**Q4：17 项主站自测的判据是什么？**
+
+覆盖：双 Unit 连接、心跳增长、PV/OP 量程、HR3 切手动回读、HR0 SP 阶跃回读、**"闭环在调"OP 响应**、只读写保护（HR1/2/4/5 外部写拒绝、批量写触及只读区整段拒绝）等，全过退出码 0。其中"闭环在调"判据经复审改为验证 **OP 对 SP 阶跃的即时响应**（增量式比例增量与阶跃同拍生效、不经过过程滞后；双窗口各 3 次采样均值差 ≥ 2.5，为寄存器量化步长的 250 倍）——旧判据"8s 内 PV 向新 SP 靠拢"落在加药回路 τ=30s 纯滞后死区内、不可复现。冷启动连跑 5 次 + 预热复跑 2 次全过（验收清单 5C）。
+
+**Q5：Z-N 整定值能直接上线吗？**
+
+不能。原始 Z-N 建议值在本项目曝气回路实测临界稳定（超调 121.8%、调节时间 1095 s），必须按工程经验修正（Kp/Ti 折减）后采用；保守 / 原始 / 修正三组同场景对照数据见 `docs/整定对比报告.md` 与 §9 对比图。
+
+**Q6：测试报告的结果可复现吗？**
+
+可以。噪声种子固定，`python run_test.py` / `python -m tune.tuner` 在干净环境对入库报告**字节级复现**（复审运行验证记录：测试报告除时间戳 diff 全等、整定报告字节级一致）；`docs/*.html` 为脚本再生工件，随代码更新重跑即可。
+
+## 11. Roadmap（规划中）
+
+以下为复审报告 03「残留风险与下一步行动」中尚未落地的真实规划项：
+
+- [ ] 回归扩展为最小 pytest 套件：PID 饱和不变量（输出恒在限幅内）、手/自动切换连续性、plant 解析稳态、`cross_time` 异常分支（当前 `tests/` 仅覆盖回绕回归 7 项）；
+- [ ] 从站 `set_sp` 增加按回路工程量程校验（余氯 0~5 / DO 0~10 mg/L，当前 0xFFFF 可被接受为 655.35），并将 `GuardedDataBlock` 静默拒绝升级为标准 Modbus 异常响应；
+- [ ] `tuner.cross_time` 对"永不达标"分支显式抛错（当前新增分支方向写反，真正的危险分支仍未防护）；`plant.reset()` 保存/恢复非默认 load0；
+- [ ] API 健壮性：非 JSON 报文统一返回 400+JSON（当前返回 text/html）；`ModbusBridge.snapshot()` 全程持锁（对齐 LocalSim）；
+- [ ] 工件治理：CI 中再生成 docs/*.html（或 gitignore）避免约 770KB 生成物与代码漂移；清理来历不明的 stash@{0}。
+
+## 12. License / 用途声明
+
+本项目以 [MIT License](LICENSE) 开源（版权人 lwj15089590118）。仅用于学习与求职作品集展示。
 **所有数据均为仿真验证值，与任何真实水厂无关。**

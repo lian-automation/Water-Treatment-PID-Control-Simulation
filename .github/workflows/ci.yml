@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax check (compileall)
+        run: python -m compileall -q control process plc_link dashboard tune run_test.py
+
+      - name: Regression tests (negative-PV wraparound, unittest)
+        run: python -m unittest discover -s tests -v
+
+      - name: Start Modbus slave (pure-software local slave, offline)
+        run: |
+          python -m plc_link.modbus_server --port 5020 &
+          for i in $(seq 1 30); do
+            if python -c "import socket; socket.create_connection(('127.0.0.1', 5020), 1).close()" 2>/dev/null; then
+              echo "slave ready"; break
+            fi
+            sleep 1
+          done
+
+      - name: Modbus master self-test (17 checks)
+        run: python -m plc_link.modbus_client_test --host 127.0.0.1 --port 5020
