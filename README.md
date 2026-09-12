@@ -1,6 +1,6 @@
 # 水处理加药/曝气回路 PID 控制仿真
 
-[![CI](https://github.com/lwj15089590118/Water-Treatment-PID-Control-Simulation/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lwj15089590118/Water-Treatment-PID-Control-Simulation/actions/workflows/ci.yml)
+[![CI](https://github.com/lian-automation/Water-Treatment-PID-Control-Simulation/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lian-automation/Water-Treatment-PID-Control-Simulation/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 
@@ -276,5 +276,5 @@ python run_test.py             # 三场景测试 + 报告
 
 ## 12. License / 用途声明
 
-本项目以 [MIT License](LICENSE) 开源（版权人 lwj15089590118）。仅用于学习与求职作品集展示。
+本项目以 [MIT License](LICENSE) 开源（版权人 lian-automation）。仅用于学习与求职作品集展示。
 **所有数据均为仿真验证值，与任何真实水厂无关。**
